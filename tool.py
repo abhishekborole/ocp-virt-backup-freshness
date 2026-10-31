@@ -1,71 +1,42 @@
-"""Offline analysis; consumes normalized JSON, never connects to infrastructure."""
+"""Query OADP/Velero backups covering the selected namespace and flag stale or incomplete backups."""
 import argparse
-import ipaddress
+from decimal import Decimal
 import json
-import math
-from pathlib import Path
 import sys
+import subprocess
+from datetime import datetime, timezone
+from oc_client import Client, VM, VMI, MIG, SNAP, quantity, age_hours, condition, require_name, stopped, escape, migration
 
 
-def positive(value):
-    if value <= 0:
-        raise ValueError('Expected a positive value')
-    return value
-
-
-def integer_positive(value):
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError('Expected a positive integer')
-    return positive(value)
-
-
-def validate(value, schema, path='input'):
-    """Validate required fields and primitive types; allow extra keys."""
-    if isinstance(schema, dict):
-        if not isinstance(value, dict): raise ValueError(path + ': expected object')
-        for key, child in schema.items():
-            if key not in value: raise ValueError(path + ': missing ' + key)
-            validate(value[key], child, path + '.' + key)
-    elif isinstance(schema, list):
-        if not isinstance(value, list): raise ValueError(path + ': expected list')
-        if schema:
-            for index, item in enumerate(value): validate(item, schema[0], path + '[' + str(index) + ']')
-    elif isinstance(schema, bool):
-        if not isinstance(value, bool): raise ValueError(path + ': expected boolean')
-    elif isinstance(schema, (int, float)):
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-            raise ValueError(path + ': expected finite number')
-        if isinstance(schema, int) and not isinstance(value, int): raise ValueError(path + ': expected integer')
-        if schema >= 0 and value < 0: raise ValueError(path + ': expected nonnegative number')
-    elif not isinstance(value, str):
-        raise ValueError(path + ': expected string')
-
-
-def analyze(data):
-    validate(data, SCHEMA)
-    return _analyze(data)
+def execute(client,args):
+    backups = Client(args.context,args.backup_namespace).items('backups.velero.io')
+    rows = []
+    for backup in backups:
+        spec,status = backup.get('spec',{}),backup.get('status',{})
+        included,excluded = spec.get('includedNamespaces',['*']),spec.get('excludedNamespaces',[])
+        if args.namespace in excluded or ('*' not in included and args.namespace not in included): continue
+        age = age_hours(status.get('completionTimestamp'))
+        rows.append({'name':backup['metadata']['name'],'phase':status.get('phase'),'age_hours':age,'stale_or_incomplete':status.get('phase') != 'Completed' or age is None or age > args.max_age_hours,
+                     'resource_filter':spec.get('includedResources',[]),'label_selector':spec.get('labelSelector'),'errors':status.get('errors',0),'warnings':status.get('warnings',0)})
+    return {'namespace':args.namespace,'backups':rows,'namespace_coverage_only':True}
 
 
 def main():
-    parser = argparse.ArgumentParser(description=DESCRIPTION)
-    parser.add_argument('input', type=Path, help='Normalized JSON file; see examples/sample.json')
+    parser = argparse.ArgumentParser(description='Query OADP/Velero backups covering the selected namespace and flag stale or incomplete backups.')
+    parser.add_argument('--context',required=True,help='Explicit existing oc kubeconfig context')
+    parser.add_argument('--namespace',required=True,help='Namespace for workload operations')
+    parser.add_argument('--name',help='Exact workload/resource name where required')
+    parser.add_argument('--apply',action='store_true',help='Execute the requested change; default is preview')
+    parser.add_argument('--backup-namespace',default='openshift-adp')
+    parser.add_argument('--max-age-hours',type=float,default=24)
     args = parser.parse_args()
     try:
-        with args.input.open(encoding='utf-8-sig') as stream:
-            data = json.load(stream)
-        print(json.dumps(analyze(data), indent=2, sort_keys=True, allow_nan=False))
-    except (OSError, ValueError, TypeError, KeyError) as error:
-        print('Input error: ' + str(error), file=sys.stderr)
+        result = execute(Client(args.context,args.namespace),args)
+        print(json.dumps({'context':args.context,'namespace':args.namespace,'collected_at':datetime.now(timezone.utc).isoformat(),'result':result},indent=2))
+    except (RuntimeError,ValueError,KeyError,OSError,TimeoutError,subprocess.SubprocessError) as error:
+        print(str(error),file=sys.stderr)
         return 2
     return 0
 
 
-SCHEMA = {'vms': [{'name': 'database', 'backup_age_hours': 4, 'rpo_hours': 24}]}
-DESCRIPTION = 'Compare backup ages with per-VM recovery-point budgets.'
-
-def _analyze(data):
-    overdue = [vm['name'] for vm in data['vms'] if vm['backup_age_hours'] > vm['rpo_hours']]
-    return {'overdue':overdue, 'within_rpo':not overdue}
-
-if __name__ == '__main__':
-    raise SystemExit(main())
+if __name__ == '__main__': raise SystemExit(main())

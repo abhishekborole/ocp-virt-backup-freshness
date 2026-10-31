@@ -1,9 +1,0 @@
-{
-  "vms": [
-    {
-      "name": "database",
-      "backup_age_hours": 4,
-      "rpo_hours": 24
-    }
-  ]
-}
